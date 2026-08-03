@@ -104,7 +104,9 @@ class UptimeKumaApi:
         )
 
     def login(self, username, password, token=""):
-        payload = {"username": username, "password": password}
+        payload = {}
+        if username and password:
+            payload = {"username": username, "password": password}
         if token:
             payload["token"] = token
         res = self.sio.call("login", payload, timeout=self.timeout)
