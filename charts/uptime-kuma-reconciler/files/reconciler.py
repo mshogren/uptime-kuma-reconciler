@@ -568,8 +568,8 @@ def watch_loop(api, tag_id):
 
 def main():
     kuma_url = os.environ["KUMA_URL"]
-    username = os.environ["KUMA_USERNAME"]
-    password = os.environ["KUMA_PASSWORD"]
+    username = os.environ.get("KUMA_USERNAME")
+    password = os.environ.get("KUMA_PASSWORD")
 
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
