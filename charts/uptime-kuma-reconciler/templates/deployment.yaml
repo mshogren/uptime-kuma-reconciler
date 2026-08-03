@@ -36,8 +36,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: {{ include "uptime-kuma-reconciler.fullname" . }}-config
-          {{- $secretName := include "uptime-kuma-reconciler.secretName" }}
-          {{- $secretObj := lookup "v1" "Secret" .Release.Namespace $secretName -}}
+          {{- $secretName := include "uptime-kuma-reconciler.secretName" . }}
+          {{- $secretObj := lookup "v1" "Secret" .Release.Namespace $secretName }}
           {{- if $secretObj }}
           env:
             - name: KUMA_USERNAME
