@@ -104,10 +104,10 @@ class UptimeKumaApi:
         )
 
     def login(self, username, password, token=""):
-        payload = {"username": None, "password": None}
+        payload = {"username": username, "password": password}
         if token:
             payload["token"] = token
-        res = self.sio.call("login", payload, timeout=self.timeout)
+        res = self.sio.call("login", timeout=self.timeout)
         if not (isinstance(res, dict) and res.get("ok")):
             if isinstance(res, dict) and res.get("tokenRequired"):
                 raise RuntimeError(
