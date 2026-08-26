@@ -254,8 +254,14 @@ def get_managed_monitors(api):
         name = m.get("name", "")
         if not name:
             continue
-        tags = [t.get("name", "") for t in m.get("tags", [])]
+        tags = [t.get("name", "") for t in (m.get("tags") or [])]
         m["_tagged"] = MANAGED_TAG in tags
+        # Only adopt untagged monitors whose name follows the reconciler
+        # convention ("namespace/Kind/name" or "static/name"), per #11 --
+        # never claim a monitor a human created by hand. Tagged monitors are
+        # always ours regardless of name.
+        if not m["_tagged"] and "/" not in name:
+            continue
         # A tagged monitor always wins over an untagged one of the same name.
         if name not in managed or (m["_tagged"] and not managed[name].get("_tagged")):
             managed[name] = m
