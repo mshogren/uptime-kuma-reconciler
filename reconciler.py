@@ -236,32 +236,56 @@ def connect_kuma(url, username, password):
     return api
 
 
-def get_managed_monitors(api, tag_id=None):
-    """Return monitors managed by the reconciler, keyed by name.
+def get_managed_monitors(api):
+    """Monitors we own, keyed by name.
 
-    If *tag_id* is provided, any monitor whose name matches the reconciler
-    naming convention (``namespace/Kind/name`` or ``static/name``) but is
-    missing the managed tag is *adopted*: the tag is applied so that future
-    reconcile cycles recognise it.  This prevents duplicate monitors from
-    accumulating when the reconciler restarts after crashing between
-    ``add_monitor`` and ``add_monitor_tag``.
+    Deliberately keyed on name rather than on MANAGED_TAG alone. Creating a
+    monitor is two API calls (add_monitor then add_monitor_tag); if the tag
+    call fails the monitor still exists but is untagged, so a tag-only
+    lookup misses it and recreates it on the next cycle -- forever. That
+    produced 924 duplicates of three ping monitors before it was caught,
+    26.7M heartbeat rows and a 3.6G kuma.db. Adopting an untagged monitor by
+    name (and retagging it via ensure_tagged) makes reconcile idempotent
+    even when tagging fails.
     """
     monitors = api.get_monitors()
     managed = {}
     for m in monitors:
         name = m.get("name", "")
+        if not name:
+            continue
         tags = [t.get("name", "") for t in (m.get("tags") or [])]
-        if MANAGED_TAG in tags:
+        m["_tagged"] = MANAGED_TAG in tags
+        # Only adopt untagged monitors whose name follows the reconciler
+        # convention ("namespace/Kind/name" or "static/name"), per #11 --
+        # never claim a monitor a human created by hand. Tagged monitors are
+        # always ours regardless of name.
+        if not m["_tagged"] and "/" not in name:
+            continue
+        # A tagged monitor always wins over an untagged one of the same name.
+        if name not in managed or (m["_tagged"] and not managed[name].get("_tagged")):
             managed[name] = m
-        elif tag_id is not None and "/" in name:
-            # Looks like a reconciler-managed name that lost its tag.
-            log.info("Adopting untagged monitor %r (id=%s)", name, m.get("id"))
-            try:
-                api.add_monitor_tag(tag_id, m["id"])
-                managed[name] = m
-            except Exception as e:
-                log.warning("Failed to adopt monitor %r: %s", name, e)
     return managed
+
+
+def ensure_tagged(api, tag_id, monitor, key):
+    """Attach MANAGED_TAG to a monitor we own but that isn't tagged yet.
+
+    Tagging failure must never propagate: the monitor exists and is being
+    managed, so a failed tag is cosmetic and retried next cycle. Letting it
+    raise is what made a partial create look like a total failure.
+    """
+    if monitor.get("_tagged"):
+        return
+    mid = monitor.get("id")
+    if not mid:
+        return
+    try:
+        api.add_monitor_tag(tag_id, mid)
+        monitor["_tagged"] = True
+        log.info("Adopted untagged monitor %s (id=%s)", key, mid)
+    except Exception as e:
+        log.warning("Could not tag %s (id=%s): %s", key, mid, e)
 
 
 def ensure_tag(api):
@@ -351,6 +375,7 @@ def reconcile_resource(api, resource, managed, tag_id):
 
     if key in managed:
         existing = managed[key]
+        ensure_tagged(api, tag_id, existing, key)
         needs_update = (
             existing.get("url") != url
             or existing.get("interval") != interval
@@ -370,6 +395,7 @@ def reconcile_resource(api, resource, managed, tag_id):
                 log.error("Failed to update monitor %s: %s", key, e)
     else:
         log.info("Creating monitor %s -> %s", key, url)
+        monitor_id = None
         try:
             kwargs = dict(
                 type=monitor_type, name=key, url=url,
@@ -379,10 +405,16 @@ def reconcile_resource(api, resource, managed, tag_id):
                 kwargs["parent"] = parent_id
             result = api.add_monitor(**kwargs)
             monitor_id = result.get("monitorID")
-            if monitor_id:
-                api.add_monitor_tag(tag_id, monitor_id)
         except Exception as e:
             log.error("Failed to create monitor %s: %s", key, e)
+        # Tag in its own try: a tag failure must not be reported as a create
+        # failure, or the next cycle recreates an already-created monitor.
+        if monitor_id:
+            try:
+                api.add_monitor_tag(tag_id, monitor_id)
+            except Exception as e:
+                log.warning("Created %s (id=%s) but tagging failed: %s",
+                            key, monitor_id, e)
 
 
 def load_static_monitors():
@@ -457,6 +489,7 @@ def reconcile_static_monitors(api, managed, tag_id):
 
         if key in managed:
             existing = managed[key]
+            ensure_tagged(api, tag_id, existing, key)
             needs_update = False
             if monitor_type == MonitorType.HTTP:
                 needs_update = (
@@ -483,13 +516,21 @@ def reconcile_static_monitors(api, managed, tag_id):
                     log.error("Failed to update static monitor %s: %s", key, e)
         else:
             log.info("Creating static monitor %s", key)
+            monitor_id = None
             try:
                 result = api.add_monitor(**kwargs)
                 monitor_id = result.get("monitorID")
-                if monitor_id:
-                    api.add_monitor_tag(tag_id, monitor_id)
             except Exception as e:
                 log.error("Failed to create static monitor %s: %s", key, e)
+            # Separate try -- see reconcile_resource: a tagging failure here
+            # previously surfaced as "Failed to create" while the monitor had
+            # in fact been created, causing unbounded duplication.
+            if monitor_id:
+                try:
+                    api.add_monitor_tag(tag_id, monitor_id)
+                except Exception as e:
+                    log.warning("Created static %s (id=%s) but tagging failed: %s",
+                                key, monitor_id, e)
 
     return seen_keys
 
@@ -505,7 +546,7 @@ def full_reconcile(api, tag_id):
     v1net = client.NetworkingV1Api()
     custom = client.CustomObjectsApi()
 
-    managed = get_managed_monitors(api, tag_id)
+    managed = get_managed_monitors(api)
     seen_keys = set()
 
     # --- Static monitors from ConfigMap ---
